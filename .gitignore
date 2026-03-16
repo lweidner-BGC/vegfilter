@@ -1,2 +1,6 @@
 data/*
 .claude/
+models/*
+__pycache__/
+*.pyc
+*.bin
