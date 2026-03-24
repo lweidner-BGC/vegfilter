@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
-from scipy.spatial import KDTree
-from numba import njit, prange
 from joblib import Parallel, delayed
+from scipy.spatial import cKDTree
+from numba import njit, prange
 import pgeof
 
 # pgeof column indices (fixed layout, v0.2+)
@@ -17,18 +17,22 @@ _PGEOF_NAMES = [
 # CSR helpers
 # ---------------------------------------------------------------------------
 
-def _radius_query_to_csr(ind: np.ndarray) -> tuple:
-    """Convert query_radius result (object array of int64 arrays) to CSR.
+def _radius_query_to_csr(ind) -> tuple:
+    """Convert query_ball_point result (list of lists/arrays) to CSR.
 
     Returns (nn uint32, nn_ptr uint32) where nn_ptr has length M+1.
+    Uses pre-allocated buffer + slice assignment to minimise GIL hold time.
     """
-    lengths = np.array([len(a) for a in ind], dtype=np.int64)
+    lengths = np.fromiter((len(a) for a in ind), dtype=np.int64, count=len(ind))
     nn_ptr = np.zeros(len(ind) + 1, dtype=np.uint32)
     np.cumsum(lengths, out=nn_ptr[1:])
-    if nn_ptr[-1] > 0:
-        nn = np.concatenate([np.asarray(a, dtype=np.uint32) for a in ind])
-    else:
-        nn = np.empty(0, dtype=np.uint32)
+    total = int(nn_ptr[-1])
+    if total == 0:
+        return np.empty(0, dtype=np.uint32), nn_ptr
+    nn = np.empty(total, dtype=np.uint32)
+    for i, a in enumerate(ind):
+        s = nn_ptr[i]
+        nn[s:s + len(a)] = a   # numpy slice assignment — GIL-free at C level
     return nn, nn_ptr
 
 
@@ -36,7 +40,7 @@ def _radius_query_to_csr(ind: np.ndarray) -> tuple:
 # Numba neighborhood statistics
 # ---------------------------------------------------------------------------
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _neighborhood_stats_csr(values, nn, nn_ptr):
     """Compute per-point mean and std of a scalar field over CSR neighborhoods."""
     n = len(nn_ptr) - 1
@@ -88,6 +92,7 @@ def extract_features(
     radii: list,
     scalar_fields: dict,
     k_min: int = 3,
+    query_batch: int = 300_000,
 ) -> pd.DataFrame:
     """Compute multi-scale geometric + scalar-field features.
 
@@ -98,6 +103,7 @@ def extract_features(
     radii        : list of floats — neighborhood radii
     scalar_fields: {name: float32 (N,)} — fields defined on xyz_search
     k_min        : minimum neighbors for pgeof (points with fewer → NaN row)
+    query_batch  : max query points per radius call (memory control)
 
     Returns
     -------
@@ -110,57 +116,72 @@ def extract_features(
     M = len(xyz)
     scalar_fields = {k: np.asarray(v, dtype=np.float32) for k, v in scalar_fields.items()}
 
-    tree = None  # lazy; rebuilt if xyz_search changes between radii (it won't here)
-    tree = KDTree(xyz_search)
+    tree = cKDTree(xyz_search)
 
-    all_cols = {}
-
+    # Build column names (deterministic — sorted radii)
+    col_names = []
     for radius in sorted(radii):
         tag = f"r{radius:.4g}"
+        col_names += [f"{n}_{tag}" for n in _PGEOF_NAMES]
+        col_names += [f"{fn}_{stat}_{tag}" for fn in scalar_fields for stat in ("mean", "std")]
 
-        ind = tree.query_ball_point(xyz, r=radius, workers=1)
-        nn, nn_ptr = _radius_query_to_csr(np.array(ind, dtype=object))
+    result_arr = np.full((M, len(col_names)), np.nan, dtype=np.float32)
+    n_batches = max(1, (M + query_batch - 1) // query_batch)
 
-        # --- pgeof geometric features ---
-        # Mask points with enough neighbors
-        counts = np.diff(nn_ptr.astype(np.int64))
-        valid = counts >= k_min
+    for b_idx in range(n_batches):
+        b_start = b_idx * query_batch
+        b_end = min(b_start + query_batch, M)
+        xyz_batch = xyz[b_start:b_end]
+        B = b_end - b_start
 
-        feat_block = np.full((M, len(_PGEOF_NAMES)), np.nan, dtype=np.float32)
-        if valid.any():
-            # Build sub-CSR for valid points only
-            valid_idx = np.where(valid)[0]
-            sub_nn_list = [nn[nn_ptr[i]:nn_ptr[i + 1]] for i in valid_idx]
-            sub_lengths = np.array([len(a) for a in sub_nn_list], dtype=np.int64)
-            sub_ptr = np.zeros(len(valid_idx) + 1, dtype=np.uint32)
-            np.cumsum(sub_lengths, out=sub_ptr[1:])
-            sub_nn = np.concatenate(sub_nn_list) if sub_ptr[-1] > 0 \
-                else np.empty(0, dtype=np.uint32)
+        if n_batches > 1:
+            print(f"      batch {b_idx+1}/{n_batches} ...", flush=True)
 
-            result = pgeof.compute_features(
-                xyz_search,
-                sub_nn,
-                sub_ptr,
-                k_min=k_min,
-            )
-            feat_block[valid_idx] = result
+        col_offset = 0
+        for radius in sorted(radii):
+            ind = tree.query_ball_point(xyz_batch, r=radius)
+            nn, nn_ptr = _radius_query_to_csr(np.array(ind, dtype=object))
 
-        for j, name in enumerate(_PGEOF_NAMES):
-            all_cols[f"{name}_{tag}"] = feat_block[:, j]
+            # --- pgeof geometric features ---
+            counts = np.diff(nn_ptr.astype(np.int64))
+            valid = counts >= k_min
 
-        # --- scalar field neighborhood stats (reuse same nn/nn_ptr) ---
-        for field_name, values in scalar_fields.items():
-            means, stds = _neighborhood_stats_csr(values, nn, nn_ptr)
-            all_cols[f"{field_name}_mean_{tag}"] = means
-            all_cols[f"{field_name}_std_{tag}"] = stds
+            feat_block = np.full((B, len(_PGEOF_NAMES)), np.nan, dtype=np.float32)
+            if valid.any():
+                valid_idx = np.where(valid)[0]
+                starts = nn_ptr[valid_idx].astype(np.int64)
+                ends   = nn_ptr[valid_idx + 1].astype(np.int64)
+                sub_lengths = ends - starts
+                sub_ptr = np.zeros(len(valid_idx) + 1, dtype=np.uint32)
+                np.cumsum(sub_lengths, out=sub_ptr[1:])
+                total_sub = int(sub_ptr[-1])
+                if total_sub > 0:
+                    sub_nn = np.empty(total_sub, dtype=np.uint32)
+                    for i, (s, e, ds) in enumerate(zip(starts, ends, sub_ptr)):
+                        sub_nn[ds:ds + int(e - s)] = nn[s:e]
+                    result = pgeof.compute_features(
+                        xyz_search, sub_nn, sub_ptr, k_min=k_min,
+                    )
+                    feat_block[valid_idx] = result
 
-    return pd.DataFrame(all_cols)
+            result_arr[b_start:b_end, col_offset:col_offset + len(_PGEOF_NAMES)] = feat_block
+            col_offset += len(_PGEOF_NAMES)
+
+            # --- scalar field neighborhood stats (reuse same nn/nn_ptr) ---
+            for field_name, values in scalar_fields.items():
+                means, stds = _neighborhood_stats_csr(values, nn, nn_ptr)
+                result_arr[b_start:b_end, col_offset]     = means
+                result_arr[b_start:b_end, col_offset + 1] = stds
+                col_offset += 2
+
+    return pd.DataFrame(result_arr, columns=col_names)
 
 
-def _process_tile(xyz_tile, xyz_s, sf_tile, core_idx, radii, k_min):
-    """Process one tile — runs in a worker thread."""
-    df = extract_features(xyz_tile, xyz_s, radii, sf_tile, k_min=k_min)
-    return core_idx, df.values
+def _process_tile(xyz_tile, xyz_s, sf_tile, core_idx, radii, k_min, query_batch):
+    """Process one tile — called from joblib threads."""
+    df = extract_features(xyz_tile, xyz_s, radii, sf_tile, k_min=k_min,
+                          query_batch=query_batch)
+    return core_idx, df.values, list(df.columns)
 
 
 def extract_features_tiled(
@@ -170,12 +191,14 @@ def extract_features_tiled(
     scalar_fields: dict,
     k_min: int = 3,
     tile_size: float = 20.0,
-    n_jobs: int = -1,
+    n_jobs: int = 4,
+    query_batch: int = 300_000,
 ) -> pd.DataFrame:
-    """Like extract_features but processes overlapping XY tiles in parallel.
+    """Like extract_features but processes XY tiles in parallel.
 
-    Tiles are independent so all CPU cores are used via joblib threads.
-    workers=1 is used inside each tile to avoid nested thread contention.
+    Uses joblib loky processes for genuine multicore parallelism. Each worker
+    imports its own copy of libraries (~1 GB RAM overhead per worker), so cap
+    n_jobs based on available RAM (default 8 is safe on most machines).
     """
     xyz = np.asarray(xyz, dtype=np.float32)
     xyz_search = np.asarray(xyz_search, dtype=np.float32)
@@ -211,30 +234,37 @@ def extract_features_tiled(
             tiles.append((xyz_tile, xyz_s, sf_tile, core_idx))
 
     n_tiles = len(tiles)
-    print(f"    {n_tiles} non-empty tiles, running on {n_jobs} workers ...", flush=True)
+    print(f"    {n_tiles} non-empty tiles ...", flush=True)
 
-    results = Parallel(n_jobs=n_jobs, prefer="threads", verbose=0)(
-        delayed(_process_tile)(xyz_t, xyz_s, sf_t, cidx, radii, k_min)
+    # Warm up numba JIT before processing tiles
+    _dummy = np.zeros(2, dtype=np.float32)
+    _neighborhood_stats_csr(_dummy, np.array([0, 1], dtype=np.uint32),
+                            np.array([0, 1, 2], dtype=np.uint32))
+
+    print(f"    dispatching {n_tiles} tiles ({n_jobs} workers) ...", flush=True)
+    results = Parallel(n_jobs=n_jobs, prefer="processes")(
+        delayed(_process_tile)(xyz_t, xyz_s, sf_t, cidx, radii, k_min, query_batch)
         for xyz_t, xyz_s, sf_t, cidx in tiles
     )
+    print(f"    assembling results ...", flush=True)
 
-    # Assemble results in original row order
+    result_arr = None
     col_names = None
-    result_arr = np.full((M, 1), np.nan, dtype=np.float32)  # placeholder shape
-    for core_idx, values in results:
-        if col_names is None:
-            col_names = values  # will be replaced below
+    for core_idx, values, cols in results:
+        if result_arr is None:
+            col_names = cols
             result_arr = np.full((M, values.shape[1]), np.nan, dtype=np.float32)
         result_arr[core_idx] = values
 
-    # Recover column names from first result's DataFrame shape
-    # (re-derive from a dummy single-point call if needed — simpler: use last df)
-    # Column names are deterministic from radii+scalar_fields, so rebuild them
-    dummy_cols = []
-    for radius in sorted(radii):
-        tag = f"r{radius:.4g}"
-        dummy_cols += [f"{n}_{tag}" for n in _PGEOF_NAMES]
-        dummy_cols += [f"{fn}_{stat}_{tag}"
-                       for fn in scalar_fields for stat in ("mean", "std")]
+    if result_arr is None:
+        # Build empty frame with correct columns
+        col_names = []
+        for radius in sorted(radii):
+            tag = f"r{radius:.4g}"
+            col_names += [f"{n}_{tag}" for n in _PGEOF_NAMES]
+            col_names += [f"{fn}_{stat}_{tag}"
+                          for fn in scalar_fields for stat in ("mean", "std")]
+        return pd.DataFrame(np.empty((M, len(col_names)), dtype=np.float32),
+                            columns=col_names)
 
-    return pd.DataFrame(result_arr, columns=dummy_cols)
+    return pd.DataFrame(result_arr, columns=col_names)

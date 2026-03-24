@@ -12,6 +12,8 @@ Usage:
         --output models/rf_veg.joblib
 """
 import argparse
+import hashlib
+import json
 import os
 
 import joblib
@@ -26,10 +28,29 @@ from feature_extraction import extract_features_tiled, spatial_subsample
 from io_utils import get_labels, get_scalar_field, load_las, rgb_to_lab_ab, _LAB_FIELDS
 
 
+def _feature_cache_path(cache_dir, path, radii, scalar_field_names, k_min,
+                         training_densities, max_points_per_density, tile_size):
+    """Return the .npz cache path for a given file + parameter combination."""
+    stat = os.stat(path)
+    key = json.dumps({
+        "path": os.path.abspath(path),
+        "mtime": stat.st_mtime,
+        "size": stat.st_size,
+        "radii": sorted(radii),
+        "scalar_field_names": sorted(scalar_field_names),
+        "k_min": k_min,
+        "training_densities": sorted(training_densities) if training_densities else None,
+        "max_points_per_density": max_points_per_density,
+        "tile_size": tile_size,
+    }, sort_keys=True)
+    digest = hashlib.md5(key.encode()).hexdigest()
+    return os.path.join(cache_dir, f"{digest}.npz")
+
+
 def _load_file_features(
     path, radii, scalar_field_names, label_field,
     unlabeled_value, veg_class, training_densities, k_min, tile_size,
-    max_points_per_density=None, rng=None,
+    max_points_per_density=None, rng=None, cache_dir=None, n_jobs=4,
 ):
     """Load one LAS file and return (X DataFrame, y_binary int32 array).
 
@@ -37,6 +58,20 @@ def _load_file_features(
     no subsampling. Features from all densities are stacked row-wise so the
     model sees the same geometry at multiple point spacings.
     """
+    # --- cache check ---
+    if cache_dir is not None:
+        cache_path = _feature_cache_path(
+            cache_dir, path, radii, scalar_field_names, k_min,
+            training_densities, max_points_per_density, tile_size,
+        )
+        if os.path.exists(cache_path):
+            print(f"  [cache] {os.path.basename(path)} — loading from cache", flush=True)
+            data = np.load(cache_path, allow_pickle=False)
+            col_names = json.loads(data["col_names_json"].item())
+            X = pd.DataFrame(data["X"], columns=col_names)
+            y = data["y"]
+            return X, y
+
     print(f"  Loading {path} ...", flush=True)
     xyz, las = load_las(path)
     labels_raw = get_labels(las, label_field)
@@ -106,12 +141,25 @@ def _load_file_features(
             scalar_fields=scalar_fields,
             k_min=k_min,
             tile_size=tile_size,
+            n_jobs=n_jobs,
         )
         X_densities.append(X_d)
         y_densities.append(y_binary)
 
     X = pd.concat(X_densities, ignore_index=True)
     y = np.concatenate(y_densities)
+
+    # --- cache save ---
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            X=X.values.astype(np.float32),
+            y=y,
+            col_names_json=np.array(json.dumps(list(X.columns))),
+        )
+        print(f"    [cache] saved to {cache_path}", flush=True)
+
     return X, y
 
 
@@ -119,7 +167,7 @@ def collect_training_data(
     las_paths, radii, scalar_field_names,
     label_field="Label", unlabeled_value=-1, veg_class=0,
     training_densities=None, k_min=3, tile_size=20.0,
-    max_points_per_density=None,
+    max_points_per_density=None, cache_dir=None, n_jobs=4,
 ):
     """Load all files, extract features, return (X, y, file_ids).
 
@@ -139,6 +187,8 @@ def collect_training_data(
             path, radii, scalar_field_names, label_field,
             unlabeled_value, veg_class, training_densities, k_min, tile_size,
             max_points_per_density=max_points_per_density,
+            cache_dir=cache_dir,
+            n_jobs=n_jobs,
         )
         if X_file is None:
             continue
@@ -200,7 +250,7 @@ def lofo_cross_validation(las_paths, radii, scalar_field_names,
                            label_field, unlabeled_value, veg_class,
                            training_densities, k_min, tile_size,
                            max_points_per_density=None,
-                           n_estimators=150, max_depth=25):
+                           n_estimators=150, max_depth=25, cache_dir=None, n_jobs=4):
     """Leave-one-file-out cross-validation. Prints per-fold and overall metrics."""
     print("\n=== Leave-One-File-Out Cross-Validation ===")
 
@@ -211,6 +261,8 @@ def lofo_cross_validation(las_paths, radii, scalar_field_names,
         veg_class=veg_class, training_densities=training_densities,
         k_min=k_min, tile_size=tile_size,
         max_points_per_density=max_points_per_density,
+        cache_dir=cache_dir,
+        n_jobs=n_jobs,
     )
 
     unique_fids = np.unique(file_ids)
@@ -274,15 +326,22 @@ def main():
                              "Keeps total training set manageable (e.g. 8000 → ~450K max total).")
     parser.add_argument("--tile-size", type=float, default=20.0,
                         help="XY tile size in metres for tiled KDTree (default: 20)")
+    parser.add_argument("--n-jobs", type=int, default=4, dest="n_jobs",
+                        help="Parallel workers for tile processing (default: 8). "
+                             "Each worker uses ~1-2 GB RAM per worker; increase if you have spare RAM (rule of thumb: free_GB / 2).")
     parser.add_argument("--k-min", type=int, default=3)
     parser.add_argument("--n-estimators", type=int, default=150)
     parser.add_argument("--max-depth", type=int, default=25)
     parser.add_argument("--output", default="models/rf_veg.joblib")
     parser.add_argument("--lofo", action="store_true",
                         help="Run leave-one-file-out CV before final training")
+    parser.add_argument("--cache-dir", default="cache/", dest="cache_dir",
+                        help="Directory to cache per-file features (default: cache/). "
+                             "Pass empty string to disable.")
     args = parser.parse_args()
 
     training_densities = args.training_densities  # None means [None] inside collect_training_data
+    cache_dir = args.cache_dir if args.cache_dir else None
 
     if args.lofo:
         lofo_cross_validation(
@@ -298,6 +357,8 @@ def main():
             max_points_per_density=args.max_points_per_density,
             n_estimators=args.n_estimators,
             max_depth=args.max_depth,
+            cache_dir=cache_dir,
+            n_jobs=args.n_jobs,
         )
         print()
 
@@ -313,6 +374,8 @@ def main():
         k_min=args.k_min,
         tile_size=args.tile_size,
         max_points_per_density=args.max_points_per_density,
+        cache_dir=cache_dir,
+        n_jobs=args.n_jobs,
     )
     pipeline = train_model(X, y,
                            n_estimators=args.n_estimators,

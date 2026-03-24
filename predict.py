@@ -10,7 +10,7 @@ import argparse
 
 import joblib
 import numpy as np
-from scipy.spatial import KDTree
+from scipy.spatial import cKDTree
 
 from feature_extraction import extract_features_tiled, spatial_subsample
 from io_utils import get_scalar_field, load_las, write_las_with_prediction, rgb_to_lab_ab, _LAB_FIELDS
@@ -18,7 +18,7 @@ from io_utils import get_scalar_field, load_las, write_las_with_prediction, rgb_
 
 def propagate_to_full_cloud(core_preds, xyz_core, xyz_full) -> np.ndarray:
     """Assign each full-cloud point the label of its nearest core point."""
-    tree = KDTree(xyz_core)
+    tree = cKDTree(xyz_core)
     _, idx = tree.query(xyz_full, k=1, workers=-1)
     return core_preds[idx]
 
@@ -29,6 +29,7 @@ def predict_las(
     output_path,
     core_voxel_size=None,
     tile_size=20.0,
+    n_jobs=4,
     pred_field_name="PredictedClass",
     write_probabilities=False,
 ):
@@ -76,6 +77,7 @@ def predict_las(
         radii=radii,
         scalar_fields=scalar_fields,
         tile_size=tile_size,
+        n_jobs=n_jobs,
     )
 
     if list(X.columns) != feature_names:
@@ -128,6 +130,9 @@ def main():
     parser.add_argument("model_path")
     parser.add_argument("--output", required=True)
     parser.add_argument("--core-voxel-size", type=float, default=None)
+    parser.add_argument("--n-jobs", type=int, default=4, dest="n_jobs",
+                        help="Parallel workers for tile processing (default: 8). "
+                             "Each worker uses ~1-2 GB RAM per worker; increase if you have spare RAM (rule of thumb: free_GB / 2).")
     parser.add_argument("--pred-field-name", default="PredictedClass")
     parser.add_argument("--write-probabilities", action="store_true")
     args = parser.parse_args()
@@ -137,6 +142,7 @@ def main():
         model_path=args.model_path,
         output_path=args.output,
         core_voxel_size=args.core_voxel_size,
+        n_jobs=args.n_jobs,
         pred_field_name=args.pred_field_name,
         write_probabilities=args.write_probabilities,
     )
